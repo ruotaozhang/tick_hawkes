@@ -4,6 +4,9 @@
 # But allow hawkes_conditional_law.py
 !hawkes_conditional_law.py
 
+# Allow run_hawkes_analysis.py
+!run_hawkes_analysis.py
+
 # Allow .gitignore itself
 !.gitignore
 
@@ -31,5 +34,4 @@ build/
 *.npz
 *.png
 tests/
-run_*.py
 test_*.py
