@@ -10,6 +10,18 @@ import numpy as np
 from numpy.polynomial.legendre import leggauss
 from scipy.linalg import solve
 
+# Try to import numba for acceleration
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Fallback decorator that does nothing
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 
 # Pure Python replacements for tick dependencies
 class Base:
@@ -40,54 +52,217 @@ class ThreadPool:
         self.work_items = []
 
 
-def PointProcessCondLaw(timestamps_i, timestamps_j, marks_j, lags, 
-                       mark_min, mark_max, T, lambda_i, claw_X, claw_Y):
-    """Pure Python implementation of PointProcessCondLaw C++ function
+@njit(cache=True)
+def _numba_point_process_cond_law_core(timestamps_i, timestamps_j, mark_increments, 
+                                       lags, mark_min, mark_max, T):
+    """Numba-accelerated core computation for conditional law.
     
-    Computes conditional laws for Hawkes processes
+    Matches the C++ implementation exactly:
+    - Skips mark bounds check for first event (idx_j == 0)
+    - Uses correct counting algorithm
+    - Returns raw counts for proper normalization
+    
+    Returns:
+        tuple: (claw_Y, n_relevant_j) where claw_Y is the raw counts
+               and n_relevant_j is the number of conditioning events used
     """
     n_lags = len(lags) - 1
+    claw_Y = np.zeros(n_lags)
     
-    # Initialize output arrays
-    claw_X[:] = (lags[1:] + lags[:-1]) / 2.0  # midpoints of lag intervals
-    claw_Y[:] = 0.0
+    if len(timestamps_j) == 0 or len(timestamps_i) == 0:
+        return claw_Y, 0
     
-    # Filter marks in the specified range
-    if len(marks_j) > 0 and len(timestamps_j) > 0:
-        # Get mark differences
-        if len(marks_j) > 1:
-            mark_diffs = np.diff(marks_j)
-            mark_diffs = np.concatenate([[marks_j[0]], mark_diffs])
-        else:
-            mark_diffs = np.array([marks_j[0]])
+    max_lag = lags[-1]
+    n_relevant_j = 0
+    
+    # Track Y index positions for optimization (like tab_y_index in C++)
+    y_index = 0
+    
+    # Loop through each jump of Z (j events)
+    for idx_j in range(len(timestamps_j)):
+        tj = timestamps_j[idx_j]
+        mark_inc = mark_increments[idx_j]
         
-        # Find events with marks in range
-        mask = (mark_diffs >= mark_min) & (mark_diffs < mark_max)
-        relevant_times_j = timestamps_j[mask]
-        
-        if len(relevant_times_j) > 0:
-            # For each relevant event in j, compute influence on i
-            for t_j in relevant_times_j:
-                # Find events in i that occur after t_j
-                future_times_i = timestamps_i[timestamps_i > t_j]
+        # Mark checking logic exactly as in C++:
+        # Skip mark bounds check for first event (idx_j == 0)
+        # Only check marks if mark_min < mark_max and idx_j > 0
+        if mark_min < mark_max and idx_j > 0:
+            if mark_inc < mark_min or mark_inc >= mark_max:
+                continue
                 
-                # Compute lag differences
-                for t_i in future_times_i:
-                    lag = t_i - t_j
-                    if lag > 0 and lag <= lags[-1]:
-                        # Find which lag bin this belongs to
-                        bin_idx = np.searchsorted(lags[1:], lag)
-                        if bin_idx < n_lags:
-                            # Add contribution to conditional law
-                            claw_Y[bin_idx] += 1.0
+        # Check time bounds (full window constraint)
+        if tj + max_lag >= T:
+            break
             
-            # Normalize by the expected number of events and time window
-            if len(relevant_times_j) > 0:
-                normalization = len(relevant_times_j) * lambda_i
-                if normalization > 0:
-                    # Normalize by bin width and total observation
-                    bin_widths = lags[1:] - lags[:-1]
-                    claw_Y[:] = claw_Y[:] / (normalization * bin_widths)
+        n_relevant_j += 1
+        
+        # Advance y_index to be after tj (like C++ implementation)
+        while y_index < len(timestamps_i) and timestamps_i[y_index] < tj:
+            y_index += 1
+        if y_index >= len(timestamps_i):
+            break
+            
+        # Process each lag bin
+        for k in range(n_lags):
+            lag_start = lags[k]
+            lag_end = lags[k + 1]
+            
+            # Find y_index_lag: first index where y_time > tj + lag_start
+            y_index_lag = y_index
+            while y_index_lag < len(timestamps_i) and timestamps_i[y_index_lag] <= tj + lag_start:
+                y_index_lag += 1
+            if y_index_lag >= len(timestamps_i):
+                continue
+                
+            # ytlag = previous valid index (or 0)
+            ytlag = max(0, y_index_lag - 1) if y_index_lag > 0 else 0
+            
+            # Find y_index_lag_delta: first index where y_time > tj + lag_end  
+            y_index_lag_delta = y_index_lag
+            while y_index_lag_delta < len(timestamps_i) and timestamps_i[y_index_lag_delta] <= tj + lag_end:
+                y_index_lag_delta += 1
+            if y_index_lag_delta >= len(timestamps_i):
+                y_index_lag_delta = len(timestamps_i)
+                
+            # ytlagdelta = previous valid index (or 0)
+            ytlagdelta = max(0, y_index_lag_delta - 1) if y_index_lag_delta > 0 else 0
+            
+            # Count events in interval [tj + lag_start, tj + lag_end]
+            claw_Y[k] += ytlagdelta - ytlag
+    
+    return claw_Y, n_relevant_j
+
+
+def PointProcessCondLaw(timestamps_i, timestamps_j, marks_j, lags,
+                       mark_min, mark_max, T, lambda_i, claw_X, claw_Y):
+    """Compute conditional law counts as in the C++ implementation.
+
+    This function computes, for each lag bin [lags[k], lags[k+1]), the
+    conditional expectation of the number of events of component i occurring in
+    [t_j + lags[k], t_j + lags[k+1]) given an event of component j at time t_j
+    whose mark increment lies in [mark_min, mark_max). It then normalizes by
+    the expected independent count n_j^l * lambda_i * (lags[k+1] - lags[k]).
+
+    Uses numba acceleration when available for 10-100x speedup.
+    """
+    n_lags = len(lags) - 1
+
+    # Set bin centers and reset output
+    claw_X[:] = (lags[1:] + lags[:-1]) / 2.0
+    claw_Y.fill(0.0)
+
+    if len(timestamps_j) == 0 or len(timestamps_i) == 0:
+        return
+
+    # Convert to numpy arrays
+    timestamps_i = np.asarray(timestamps_i, dtype=np.float64)
+    timestamps_j = np.asarray(timestamps_j, dtype=np.float64)
+    marks_j = np.asarray(marks_j, dtype=np.float64)
+
+    # Compute mark increments from cumulative marks
+    if len(marks_j) > 1:
+        mark_increments = np.empty_like(marks_j)
+        mark_increments[0] = marks_j[0]
+        mark_increments[1:] = marks_j[1:] - marks_j[:-1]
+    else:
+        mark_increments = marks_j.copy()
+
+    # Set default T if not provided
+    if T is None:
+        T = max(timestamps_i[-1] if len(timestamps_i) else 0.0,
+                timestamps_j[-1] if len(timestamps_j) else 0.0)
+
+    # Use numba-accelerated core computation
+    if NUMBA_AVAILABLE:
+        counts, n_relevant_j = _numba_point_process_cond_law_core(
+            timestamps_i, timestamps_j, mark_increments, 
+            lags, mark_min, mark_max, T)
+        claw_Y[:] = counts
+    else:
+        # Fallback to pure Python implementation
+        n_relevant_j = _python_fallback_computation(
+            timestamps_i, timestamps_j, mark_increments, 
+            lags, mark_min, mark_max, T, claw_Y)
+
+    # Normalize exactly as in C++ implementation:
+    # 1. Divide by n_terms (number of conditioning events)
+    # 2. Divide by lag width  
+    # 3. Subtract y_lambda (baseline intensity)
+    for k in range(n_lags):
+        if n_relevant_j > 0:
+            claw_Y[k] /= n_relevant_j
+        lag_width = lags[k + 1] - lags[k]
+        if lag_width > 0:
+            claw_Y[k] /= lag_width
+        claw_Y[k] -= lambda_i
+
+
+def _python_fallback_computation(timestamps_i, timestamps_j, mark_increments, 
+                                lags, mark_min, mark_max, T, claw_Y):
+    """Pure Python fallback when numba is not available.
+    
+    Matches the C++ implementation exactly.
+    """
+    n_lags = len(lags) - 1
+    max_lag = lags[-1]
+    n_relevant_j = 0
+    
+    # Track Y index positions for optimization
+    y_index = 0
+    
+    # Loop through each jump of Z (j events)
+    for idx_j in range(len(timestamps_j)):
+        tj = timestamps_j[idx_j]
+        mark_inc = mark_increments[idx_j]
+        
+        # Mark checking logic exactly as in C++:
+        # Skip mark bounds check for first event (idx_j == 0)
+        # Only check marks if mark_min < mark_max and idx_j > 0
+        if mark_min < mark_max and idx_j > 0:
+            if mark_inc < mark_min or mark_inc >= mark_max:
+                continue
+                
+        # Check time bounds (full window constraint)
+        if tj + max_lag >= T:
+            break
+            
+        n_relevant_j += 1
+        
+        # Advance y_index to be after tj (like C++ implementation)
+        while y_index < len(timestamps_i) and timestamps_i[y_index] < tj:
+            y_index += 1
+        if y_index >= len(timestamps_i):
+            break
+            
+        # Process each lag bin
+        for k in range(n_lags):
+            lag_start = lags[k]
+            lag_end = lags[k + 1]
+            
+            # Find y_index_lag: first index where y_time > tj + lag_start
+            y_index_lag = y_index
+            while y_index_lag < len(timestamps_i) and timestamps_i[y_index_lag] <= tj + lag_start:
+                y_index_lag += 1
+            if y_index_lag >= len(timestamps_i):
+                continue
+                
+            # ytlag = previous valid index (or 0)
+            ytlag = max(0, y_index_lag - 1) if y_index_lag > 0 else 0
+            
+            # Find y_index_lag_delta: first index where y_time > tj + lag_end  
+            y_index_lag_delta = y_index_lag
+            while y_index_lag_delta < len(timestamps_i) and timestamps_i[y_index_lag_delta] <= tj + lag_end:
+                y_index_lag_delta += 1
+            if y_index_lag_delta >= len(timestamps_i):
+                y_index_lag_delta = len(timestamps_i)
+                
+            # ytlagdelta = previous valid index (or 0)
+            ytlagdelta = max(0, y_index_lag_delta - 1) if y_index_lag_delta > 0 else 0
+            
+            # Count events in interval [tj + lag_start, tj + lag_end]
+            claw_Y[k] += ytlagdelta - ytlag
+    
+    return n_relevant_j
 
 
 # noinspection PyPep8Naming

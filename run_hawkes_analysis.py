@@ -175,10 +175,10 @@ def main():
         min_lag=5e-4, 
         max_lag=500,
         quad_method="log", 
-        n_quad=10, 
+        n_quad=10,  # Original parameter
         min_support=1e-4, 
         max_support=1, 
-        n_threads=4
+        n_threads=1  # Single thread for pure Python implementation
     )
     
     # Fit the model
