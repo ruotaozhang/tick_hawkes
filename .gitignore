@@ -1,6 +1,3 @@
-# Ignore all files by default
-*
-
 # But allow hawkes_conditional_law.py
 !hawkes_conditional_law.py
 
