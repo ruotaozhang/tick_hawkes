@@ -7,6 +7,14 @@
 # Allow run_hawkes_analysis.py
 !run_hawkes_analysis.py
 
+# Allow V2 files
+!hawkes_conditional_law_v2.py
+!run_hawkes_analysis_v2.py
+
+# Exclude tests directory
+tests/
+test_*.py
+
 # Allow .gitignore itself
 !.gitignore
 
@@ -33,5 +41,3 @@ dist/
 build/
 *.npz
 *.png
-tests/
-test_*.py
